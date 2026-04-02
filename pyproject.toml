@@ -1,0 +1,18 @@
+[project]
+name = "interview-assistant"
+version = "0.1.0"
+description = "Personal interview-learning assistant with knowledge base and MCP server"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.27",
+    "beautifulsoup4>=4.12",
+    "psycopg2-binary>=2.9",
+    "pgvector>=0.3",
+    "mcp[cli]>=1.0",
+    "pydantic>=2.0",
+    "rich>=13.0",
+]
+
+[project.scripts]
+scrape = "scraper.main:main"
+mcp-server = "mcp_server.server:main"

@@ -1,0 +1,17 @@
+version: "3.9"
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: interview-kb-postgres
+    environment:
+      POSTGRES_DB: interview_kb
+      POSTGRES_USER: interview
+      POSTGRES_PASSWORD: interview_pass
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql
+
+volumes:
+  pgdata:
