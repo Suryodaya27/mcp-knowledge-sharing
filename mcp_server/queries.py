@@ -263,42 +263,79 @@ def get_user_progress() -> list[dict]:
                           COALESCE(up.total_attempts, 0) AS attempts,
                           COALESCE(up.total_correct, 0) AS correct,
                           up.last_practiced_at,
-                          COUNT(c.id) AS total_concepts
+                          COUNT(c.id) AS total_concepts,
+                          up.easiness_factor,
+                          up.interval_days,
+                          up.next_review_at
                    FROM topics t
                    JOIN categories cat ON t.category_id = cat.id
                    LEFT JOIN user_progress up ON up.topic_id = t.id
                    LEFT JOIN concepts c ON c.topic_id = t.id
                    GROUP BY t.id, t.name, cat.slug, up.current_level, up.correct_streak,
-                            up.total_attempts, up.total_correct, up.last_practiced_at
+                            up.total_attempts, up.total_correct, up.last_practiced_at,
+                            up.easiness_factor, up.interval_days, up.next_review_at
                    ORDER BY t.name"""
             )
-            cols = ["topic_id", "topic", "category", "level", "streak", "attempts", "correct", "last_practiced", "total_concepts"]
+            cols = ["topic_id", "topic", "category", "level", "streak", "attempts",
+                    "correct", "last_practiced", "total_concepts",
+                    "easiness_factor", "interval_days", "next_review_at"]
             rows = [_row_to_dict(row, cols) for row in cur.fetchall()]
             for r in rows:
                 r["level_name"] = LEVEL_NAMES.get(r["level"], "advanced")
                 r["accuracy"] = round(r["correct"] / r["attempts"] * 100, 1) if r["attempts"] > 0 else 0
                 if r["last_practiced"]:
                     r["last_practiced"] = r["last_practiced"].isoformat()
+                if r["next_review_at"]:
+                    r["next_review_at"] = r["next_review_at"].isoformat()
             return rows
     finally:
         conn.close()
 
 
+def _sm2_update(easiness_factor: float, interval_days: float, is_correct: bool, streak: int) -> tuple[float, float]:
+    """SM-2 spaced repetition algorithm.
+    Returns (new_easiness_factor, new_interval_days)."""
+    if is_correct:
+        if streak <= 1:
+            new_interval = 1.0
+        elif streak == 2:
+            new_interval = 6.0
+        else:
+            new_interval = interval_days * easiness_factor
+        # EF stays the same or increases slightly on correct answers
+        new_ef = max(1.3, easiness_factor + 0.1)
+    else:
+        # Wrong answer: reset interval, decrease easiness
+        new_interval = 1.0
+        new_ef = max(1.3, easiness_factor - 0.2)
+    return new_ef, round(new_interval, 1)
+
+
 def record_answer(topic_id: int, is_correct: bool) -> dict:
-    """Record an answer and update progress. Returns updated progress."""
+    """Record an answer, update progress with SM-2 spaced repetition. Returns updated progress."""
     conn = get_conn()
     try:
         with conn.cursor() as cur:
             # Upsert progress
             cur.execute(
-                """INSERT INTO user_progress (topic_id, current_level, correct_streak, total_attempts, total_correct, last_practiced_at)
-                   VALUES (%s, 1, 0, 0, 0, NOW())
+                """INSERT INTO user_progress
+                       (topic_id, current_level, correct_streak, total_attempts, total_correct,
+                        last_practiced_at, easiness_factor, interval_days, next_review_at)
+                   VALUES (%s, 1, 0, 0, 0, NOW(), 2.5, 1.0, NOW())
                    ON CONFLICT (topic_id) DO NOTHING""",
                 (topic_id,),
             )
             conn.commit()
 
+            # Get current SM-2 state
+            cur.execute(
+                "SELECT easiness_factor, interval_days, correct_streak FROM user_progress WHERE topic_id = %s",
+                (topic_id,),
+            )
+            ef, interval, streak = cur.fetchone()
+
             if is_correct:
+                new_streak = streak + 1
                 cur.execute(
                     """UPDATE user_progress
                        SET correct_streak = correct_streak + 1,
@@ -310,9 +347,9 @@ def record_answer(topic_id: int, is_correct: bool) -> dict:
                     (topic_id,),
                 )
                 row = cur.fetchone()
-                streak, level = row[0], row[1]
+                new_streak, level = row[0], row[1]
                 # Level up if streak threshold met and not already max
-                if streak >= STREAK_TO_LEVEL_UP and level < 3:
+                if new_streak >= STREAK_TO_LEVEL_UP and level < 3:
                     cur.execute(
                         """UPDATE user_progress
                            SET current_level = current_level + 1, correct_streak = 0
@@ -320,6 +357,7 @@ def record_answer(topic_id: int, is_correct: bool) -> dict:
                         (topic_id,),
                     )
             else:
+                new_streak = 0
                 cur.execute(
                     """UPDATE user_progress
                        SET correct_streak = 0,
@@ -328,38 +366,56 @@ def record_answer(topic_id: int, is_correct: bool) -> dict:
                        WHERE topic_id = %s""",
                     (topic_id,),
                 )
+
+            # Apply SM-2 algorithm
+            new_ef, new_interval = _sm2_update(ef, interval, is_correct, new_streak)
+            cur.execute(
+                """UPDATE user_progress
+                   SET easiness_factor = %s,
+                       interval_days = %s,
+                       next_review_at = NOW() + (%s || ' days')::INTERVAL
+                   WHERE topic_id = %s""",
+                (new_ef, new_interval, str(new_interval), topic_id),
+            )
             conn.commit()
 
             # Return updated state
             cur.execute(
                 """SELECT up.current_level, up.correct_streak, up.total_attempts, up.total_correct,
-                          t.name AS topic
+                          t.name AS topic, up.easiness_factor, up.interval_days, up.next_review_at
                    FROM user_progress up
                    JOIN topics t ON up.topic_id = t.id
                    WHERE up.topic_id = %s""",
                 (topic_id,),
             )
             row = cur.fetchone()
-            result = _row_to_dict(row, ["level", "streak", "attempts", "correct", "topic"])
+            result = _row_to_dict(row, ["level", "streak", "attempts", "correct", "topic",
+                                        "easiness_factor", "interval_days", "next_review_at"])
             result["level_name"] = LEVEL_NAMES.get(result["level"], "advanced")
             result["accuracy"] = round(result["correct"] / result["attempts"] * 100, 1) if result["attempts"] > 0 else 0
             result["leveled_up"] = is_correct and result["streak"] == 0 and result["level"] > 1
+            if result["next_review_at"]:
+                result["next_review_at"] = result["next_review_at"].isoformat()
             return result
     finally:
         conn.close()
 
 
 def get_quiz_taught_only() -> dict | None:
-    """Get a quiz concept only from topics the user has already been taught (has progress)."""
+    """Get a quiz concept only from topics the user has already been taught (has progress).
+    Prioritizes topics due for review via spaced repetition."""
     conn = get_conn()
     try:
         with conn.cursor() as cur:
-            # Pick a random topic that has user_progress entries
+            # Pick topic most due for review among taught topics
             cur.execute(
                 """SELECT t.id, COALESCE(up.current_level, 1) AS level
                    FROM topics t
                    JOIN user_progress up ON up.topic_id = t.id
-                   ORDER BY RANDOM()
+                   ORDER BY
+                       CASE WHEN up.next_review_at <= NOW() THEN 0 ELSE 1 END,
+                       up.next_review_at ASC,
+                       RANDOM()
                    LIMIT 1"""
             )
             row = cur.fetchone()
@@ -425,7 +481,7 @@ def get_quiz_random() -> dict | None:
 
 def get_quiz_for_level(topic_id: int = None) -> dict | None:
     """Get a concept matching the user's current level for a topic.
-    If no topic_id, picks the least-practiced topic."""
+    If no topic_id, picks the topic most due for review (spaced repetition)."""
     conn = get_conn()
     try:
         with conn.cursor() as cur:
@@ -435,12 +491,17 @@ def get_quiz_for_level(topic_id: int = None) -> dict | None:
                 row = cur.fetchone()
                 level = row[0] if row else 1
             else:
-                # Pick least-practiced topic
+                # Pick topic most due for review: past next_review_at first, then never-practiced
                 cur.execute(
                     """SELECT t.id, COALESCE(up.current_level, 1) AS level
                        FROM topics t
                        LEFT JOIN user_progress up ON up.topic_id = t.id
-                       ORDER BY up.last_practiced_at ASC NULLS FIRST, RANDOM()
+                       ORDER BY
+                           CASE WHEN up.next_review_at IS NULL THEN 0
+                                WHEN up.next_review_at <= NOW() THEN 1
+                                ELSE 2 END,
+                           up.next_review_at ASC NULLS FIRST,
+                           RANDOM()
                        LIMIT 1"""
                 )
                 row = cur.fetchone()

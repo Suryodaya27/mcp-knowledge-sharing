@@ -52,3 +52,18 @@ CREATE INDEX IF NOT EXISTS idx_concepts_topic_id ON concepts(topic_id);
 CREATE INDEX IF NOT EXISTS idx_concepts_tags ON concepts USING GIN(tags);
 CREATE INDEX IF NOT EXISTS idx_concepts_difficulty ON concepts(difficulty);
 CREATE INDEX IF NOT EXISTS idx_concepts_embedding ON concepts USING hnsw (embedding vector_cosine_ops);
+
+-- User progress with spaced repetition (SM-2)
+CREATE TABLE IF NOT EXISTS user_progress (
+    id SERIAL PRIMARY KEY,
+    topic_id INTEGER NOT NULL UNIQUE REFERENCES topics(id) ON DELETE CASCADE,
+    current_level INTEGER NOT NULL DEFAULT 1,
+    correct_streak INTEGER NOT NULL DEFAULT 0,
+    total_attempts INTEGER NOT NULL DEFAULT 0,
+    total_correct INTEGER NOT NULL DEFAULT 0,
+    last_practiced_at TIMESTAMPTZ,
+    easiness_factor REAL NOT NULL DEFAULT 2.5,
+    interval_days REAL NOT NULL DEFAULT 1.0,
+    next_review_at TIMESTAMPTZ DEFAULT NOW(),
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
